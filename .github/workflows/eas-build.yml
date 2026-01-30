@@ -1,0 +1,210 @@
+name: EAS Build
+
+on:
+  push:
+    branches:
+      - native/expo-build
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        id: setup_node
+        continue-on-error: true
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup Expo
+        id: setup_expo
+        continue-on-error: true
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        run: npm install --legacy-peer-deps
+
+      - name: Setup App Store Connect API Key
+        id: asc_setup
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Setting up App Store Connect API credentials..."
+          
+          # Create directory for API key
+          ASC_KEYS_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$ASC_KEYS_DIR"
+
+          KEY_PATH="$ASC_KEYS_DIR/AuthKey_${{ secrets.APPLE_ASC_KEY_ID }}.p8"
+          
+          # Debug: show what we're working with
+          echo "Target key path: $KEY_PATH"
+          echo "APPLE_ASC_KEY_ID length: ${#APPLE_ASC_KEY_ID}"
+          
+          # Check if the base64 secret is present
+          if [ -z "${{ secrets.APPLE_ASC_API_KEY_BASE64 }}" ]; then
+            echo "ERROR: APPLE_ASC_API_KEY_BASE64 secret is empty or not set"
+            exit 1
+          fi
+          
+          # Decode base64-encoded .p8 key (Ao.dev-style: printf + base64 decode)
+          printf '%s' "${{ secrets.APPLE_ASC_API_KEY_BASE64 }}" | base64 --decode > "$KEY_PATH"
+
+          # Verify the file exists and has content
+          if [ ! -s "$KEY_PATH" ]; then
+            echo "ERROR: Key file is empty or not created"
+            echo "Base64 input length: $(printf '%s' "${{ secrets.APPLE_ASC_API_KEY_BASE64 }}" | wc -c)"
+            exit 1
+          fi
+          
+          # Verify PEM header (Ao.dev-style validation)
+          if ! head -n 1 "$KEY_PATH" | grep -q "BEGIN PRIVATE KEY"; then
+            echo "ERROR: Key file missing PEM header"
+            echo "First line: $(head -n 1 "$KEY_PATH")"
+            echo "File contents preview:"
+            head -c 100 "$KEY_PATH" | xxd
+            exit 1
+          fi
+
+          echo "App Store Connect API key configured successfully"
+          echo "  File size: $(wc -c < "$KEY_PATH") bytes"
+          echo "  Lines: $(wc -l < "$KEY_PATH")"
+          
+          # Export the full path for subsequent steps
+          echo "asc_key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+
+      - name: Build iOS
+        id: ios_build
+        continue-on-error: true
+        run: |
+          echo "Starting iOS build..."
+
+          eas --version || true
+          
+          # Run EAS build and wait for completion (capture output for better error reporting)
+          IOS_LOG_FILE="eas-ios.log"
+          set -o pipefail
+          eas build --platform ios --profile production --non-interactive --wait 2>&1 | tee "$IOS_LOG_FILE"
+          
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+          echo "EAS build exit code: $BUILD_EXIT_CODE"
+          
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            echo "Build command failed"
+            # IMPORTANT (Ao.dev-style): never emit raw logs into GitHub step outputs.
+            # Raw logs can contain quotes/newlines that break subsequent bash scripts.
+            # Instead, base64-encode a tail snippet so it is always single-line + safe.
+            SNIPPET_B64=$(tail -n 160 "$IOS_LOG_FILE" | tr -d '\r' | base64 | tr -d '\n' | head -c 12000)
+            echo "eas_error_b64=$SNIPPET_B64" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          
+          # Give EAS a moment to register the completed build
+          sleep 3
+          
+          # Fetch the latest build info using JSON output (most reliable method)
+          echo "Fetching artifact URL from EAS..."
+          BUILD_JSON=$(eas build:list --platform ios --limit 1 --json --non-interactive 2>/dev/null || echo "[]")
+          echo "Build list response: $BUILD_JSON"
+          
+          # Extract the artifact URL using jq
+          IPA_URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty' 2>/dev/null || true)
+          
+          if [ -n "$IPA_URL" ] && [ "$IPA_URL" != "null" ]; then
+            echo "ipa_url=$IPA_URL" >> $GITHUB_OUTPUT
+            echo "iOS build complete! IPA URL: $IPA_URL"
+          else
+            # Try alternative field names
+            IPA_URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.applicationArchiveUrl // empty' 2>/dev/null || true)
+            if [ -n "$IPA_URL" ] && [ "$IPA_URL" != "null" ]; then
+              echo "ipa_url=$IPA_URL" >> $GITHUB_OUTPUT
+              echo "iOS artifact URL (applicationArchiveUrl): $IPA_URL"
+            else
+              echo "WARNING: Could not extract iOS artifact URL from build list"
+              echo "Build JSON was: $BUILD_JSON"
+            fi
+          fi
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # CRITICAL: This tells EAS to auto-create Distribution Certificate + Provisioning Profile
+          # for first-time builds. Without this, non-interactive builds ALWAYS fail for new apps.
+          EAS_BUILD_AUTOMATE_CREDENTIALS: "1"
+          # Remote credentials automation - EXACT Expo env var names from docs.expo.dev/build/building-on-ci
+          # Reference: https://docs.expo.dev/build/building-on-ci/#optional-provide-an-asc-api-token-for-your-apple-team
+          EXPO_ASC_API_KEY_PATH: ${{ steps.asc_setup.outputs.asc_key_path }}
+          EXPO_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          EXPO_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          EXPO_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPO_APPLE_TEAM_TYPE: ${{ secrets.APPLE_TEAM_TYPE }}
+
+      - name: Report iOS Build Result
+        if: always()
+        run: |
+          set -euo pipefail
+          IPA_URL="${{ steps.ios_build.outputs.ipa_url }}"
+          STATUS="success"
+          ERROR_MSG=""
+
+          CHECKOUT_OUTCOME="${{ steps.checkout.outcome }}"
+          SETUP_NODE_OUTCOME="${{ steps.setup_node.outcome }}"
+          SETUP_EXPO_OUTCOME="${{ steps.setup_expo.outcome }}"
+          INSTALL_OUTCOME="${{ steps.install.outcome }}"
+          ASC_SETUP_OUTCOME="${{ steps.asc_setup.outcome }}"
+          IOS_OUTCOME="${{ steps.ios_build.outcome }}"
+
+          FAILED_AT=""
+          if [ "$CHECKOUT_OUTCOME" != "success" ]; then FAILED_AT="Checkout"; fi
+          if [ -z "$FAILED_AT" ] && [ "$SETUP_NODE_OUTCOME" != "success" ]; then FAILED_AT="Setup Node.js"; fi
+          if [ -z "$FAILED_AT" ] && [ "$SETUP_EXPO_OUTCOME" != "success" ]; then FAILED_AT="Setup Expo"; fi
+          if [ -z "$FAILED_AT" ] && [ "$INSTALL_OUTCOME" != "success" ]; then FAILED_AT="Install dependencies"; fi
+          if [ -z "$FAILED_AT" ] && [ "$ASC_SETUP_OUTCOME" != "success" ]; then FAILED_AT="Setup App Store Connect API Key"; fi
+          if [ -z "$FAILED_AT" ] && [ "$IOS_OUTCOME" != "success" ]; then FAILED_AT="Build iOS"; fi
+          
+          if [ -n "$FAILED_AT" ]; then
+            STATUS="failure"
+            RAW_B64="${{ steps.ios_build.outputs.eas_error_b64 }}"
+            RAW=""
+
+            if [ -n "$RAW_B64" ] && [ "$RAW_B64" != "null" ]; then
+              RAW=$(printf '%s' "$RAW_B64" | base64 --decode 2>/dev/null || true)
+            fi
+
+            # Ao.dev-style fallback: if step outputs are missing/empty, read the log file directly.
+            # This avoids losing the real EAS error when GitHub step outputs fail to propagate.
+            if [ -z "$RAW" ] && [ -f "eas-ios.log" ]; then
+              RAW=$(tail -n 160 "eas-ios.log" | tr -d '\r' | head -c 12000 || true)
+            fi
+
+            if [ -n "$RAW" ]; then
+              ERROR_MSG="Failed at: $FAILED_AT. iOS build failed: $RAW"
+            else
+              ERROR_MSG="Failed at: $FAILED_AT. iOS build failed. Check GitHub Actions logs for details."
+            fi
+          fi
+          
+          echo "Reporting iOS build to callback with IPA URL: $IPA_URL"
+          PAYLOAD=$(jq -n \
+            --arg build_id "${{ secrets.BUILD_ID }}" \
+            --arg platform "ios" \
+            --arg status "$STATUS" \
+            --arg ipa_download_url "$IPA_URL" \
+            --arg error_message "$ERROR_MSG" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{build_id:$build_id, platform:$platform, status:$status, ipa_download_url:$ipa_download_url, error_message:$error_message, timestamp:$timestamp}')
+
+          curl -sS -X POST "https://wygdvepzbuqybajxdddv.supabase.co/functions/v1/eas-build-callback" -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" -H "Content-Type: application/json" --data-binary "$PAYLOAD" || echo "Warning: Callback failed but continuing..."
+
